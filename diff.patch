@@ -1,0 +1,127 @@
+diff --git a/src/pretty.c b/src/pretty.c
+index eb8b60c..2e23d14 100644
+--- a/src/pretty.c
++++ b/src/pretty.c
+@@ -22,7 +22,7 @@
+ #define SCREEN_WIDTH 1280
+ #define SCREEN_HEIGHT 720
+ 
+-#define TEST_COMMAND "python tests/plop.py\r"
++#define TEST_COMMAND "cat flake.nix\r"
+ 
+ static struct option LONG_OPTIONS[] = {
+     {"config", required_argument, 0, 'c'},
+@@ -146,14 +146,20 @@ int main(int argc, char **argv)
+ 
+                 case SDL_EVENT_USER:
+                     pthread_mutex_lock(&tty.lock);
+-                    if (buff_pos + tty.buff_len < sizeof(buff) - 1) {
+-                        printf("Adding %zu bytes at position %zu\n", tty.buff_len, buff_pos);
+-                        printf("First few chars: [%.20s]\n", tty.buff);
+-                        memcpy(buff + buff_pos, tty.buff, tty.buff_len);
+-                        buff_pos += tty.buff_len;
+-                        buff[buff_pos] = '\0';
++                    if (tty.buff_consumed < tty.buff_len) {
++                        size_t new_bytes = tty.buff_len - tty.buff_consumed;
++                        fprintf(stderr, "Processing %zu new bytes (consumed: %zu, total: %zu)\n", 
++                           new_bytes, tty.buff_consumed, tty.buff_len);
++
++                        if (buff_pos + new_bytes < sizeof(buff) - 1) {
++                            memcpy(buff + buff_pos, tty.buff + tty.buff_consumed, new_bytes);
++                            buff_pos += new_bytes;
++                            buff[buff_pos] = '\0';
++                            fprintf(stderr, "Added %zu bytes at position %zu\n", new_bytes, buff_pos - new_bytes);
++                        }
++
++                        tty.buff_consumed = tty.buff_len;
+                     }
+-                    tty.buff_changed = false;
+                     pthread_mutex_unlock(&tty.lock);
+                     goto render_frame;
+ render_frame:
+@@ -169,8 +175,6 @@ render_frame:
+ #ifndef WAIT_EVENTS
+         }
+ #endif
+-        if (tty.buff_changed)
+-            render_frame(renderer, win_size, buff, &font, config);
+         display_fps_metrics(win);
+     }
+ 
+diff --git a/src/slave.c b/src/slave.c
+index 516fc3b..84d1457 100644
+--- a/src/slave.c
++++ b/src/slave.c
+@@ -15,6 +15,7 @@
+ #include "pretty.h"
+ #include "slave.h"
+ #include "macro_utils.h"
++#include "pthread.h"
+ 
+ static pid_t pid;
+ 
+@@ -156,17 +157,30 @@ bool tty_update(tty_state *tty)
+         return true;
+ 
+     if (pfd.revents & POLLIN) {
+-        ssize_t n = read(tty->pty_master_fd, tty->buff, sizeof tty->buff);
++        char temp[BUFSIZ];
++        ssize_t n = read(tty->pty_master_fd, temp, sizeof temp);
+ 
+         if (n > 0) {
+-            printf("Received %zd chars\n", n);
+-            tty->buff_len = n;
+-            tty->buff_changed = true;
+-// v yeah ugh, we dont care :)
+-// TODO: care?
+-        } else if (n == 0 || errno == EIO)
++            pthread_mutex_lock(&tty->lock);
++            if (tty->buff_len + n < sizeof(tty->buff)) {
++                fprintf(stderr, "Received %zd chars, appending to buffer (current len: %zu)\n", 
++                    n, tty->buff_len);
++
++                memcpy(tty->buff + tty->buff_len, temp, n);
++                tty->buff_len += n;
++
++                if (!tty->buff_changed) {
++                    tty->buff_changed = true;
++                    notify_ui_flush();
++                }
++            } else {
++                fprintf(stderr, "WARNING: Buffer full, dropping %zd chars\n", n);
++            }
++
++            pthread_mutex_unlock(&tty->lock);
++        } else if (n == 0 || errno == EIO) {
+             return true;
+-        else {
++        } else {
+             perror("read");
+             return true;
+         }
+@@ -181,9 +195,12 @@ void *tty_poll_loop(void *arg)
+ 
+     while (true) {
+         tty_update(tty);
+-        if (tty->buff_changed) {
++        pthread_mutex_lock(&tty->lock);
++        if (tty->buff_changed && tty->buff_consumed < tty->buff_len) {
+             notify_ui_flush();
++            tty->buff_changed = false;
+         }
++        pthread_mutex_unlock(&tty->lock);
+     }
+     __builtin_unreachable();
+ }
+diff --git a/src/slave.h b/src/slave.h
+index e703948..857404b 100644
+--- a/src/slave.h
++++ b/src/slave.h
+@@ -20,6 +20,7 @@ typedef struct {
+     int pty_master_fd;
+     char buff[BUFSIZ]; /* TODO: think about this */
+     size_t buff_len;
++    size_t buff_consumed; // how much has UI proccessed
+     pthread_t thread;
+     pthread_mutex_t lock;
+     bool buff_changed;

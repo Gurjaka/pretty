@@ -15,6 +15,7 @@
 #include "pretty.h"
 #include "slave.h"
 #include "macro_utils.h"
+#include "pthread.h"
 
 static pid_t pid;
 
@@ -156,17 +157,30 @@ bool tty_update(tty_state *tty)
         return true;
 
     if (pfd.revents & POLLIN) {
-        ssize_t n = read(tty->pty_master_fd, tty->buff, sizeof tty->buff);
+        char temp[BUFSIZ];
+        ssize_t n = read(tty->pty_master_fd, temp, sizeof temp);
 
         if (n > 0) {
-            printf("Received %zd chars\n", n);
-            tty->buff_len = n;
-            tty->buff_changed = true;
-// v yeah ugh, we dont care :)
-// TODO: care?
-        } else if (n == 0 || errno == EIO)
+            pthread_mutex_lock(&tty->lock);
+            if (tty->buff_len + n < sizeof(tty->buff)) {
+                fprintf(stderr, "Received %zd chars, appending to buffer (current len: %zu)\n", 
+                    n, tty->buff_len);
+
+                memcpy(tty->buff + tty->buff_len, temp, n);
+                tty->buff_len += n;
+
+                if (!tty->buff_changed) {
+                    tty->buff_changed = true;
+                    notify_ui_flush();
+                }
+            } else {
+                fprintf(stderr, "WARNING: Buffer full, dropping %zd chars\n", n);
+            }
+
+            pthread_mutex_unlock(&tty->lock);
+        } else if (n == 0 || errno == EIO) {
             return true;
-        else {
+        } else {
             perror("read");
             return true;
         }
@@ -181,9 +195,12 @@ void *tty_poll_loop(void *arg)
 
     while (true) {
         tty_update(tty);
-        if (tty->buff_changed) {
+        pthread_mutex_lock(&tty->lock);
+        if (tty->buff_changed && tty->buff_consumed < tty->buff_len) {
             notify_ui_flush();
+            tty->buff_changed = false;
         }
+        pthread_mutex_unlock(&tty->lock);
     }
     __builtin_unreachable();
 }
