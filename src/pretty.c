@@ -196,7 +196,6 @@ int main(int argc, char **argv)
                     else pretty_log(PRETTY_DEBUG, "unhandled key: %s", SDL_GetKeyName(event.key.key));
                     break;
                 }
-
                 case SDL_EVENT_MOUSE_WHEEL:
                     if (event.wheel.y > 0) calculate_scroll(&tty, SCROLL_UP);
                     else if (event.wheel.y < 0) calculate_scroll(&tty, SCROLL_DOWN);
